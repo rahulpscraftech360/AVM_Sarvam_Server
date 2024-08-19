@@ -84,20 +84,71 @@
 // console.log('WebSocket server is running on ws://localhost:8080');
 
 
+import express from 'express';
+import { WebSocketServer, WebSocket } from 'ws'; 
+import { promises as fs } from 'fs';
+import path from 'path';
+import { createReadStream } from 'fs'; 
+import dotenv from 'dotenv';
+import FormData from 'form-data';
+import fetch from 'node-fetch';
 
+dotenv.config();
 
-import { WebSocketServer } from 'ws';
-import fs from 'fs/promises';
+const app = express();
+const port = process.env.PORT || 8080;
 
-const wss = new WebSocketServer({ port: 8080 });
+// WebSocket setup
+const server = app.listen(port, () => {
+  console.log(`Express server is running on http://localhost:${port}`);
+});
 
-let audioBuffer = [];
-let fileCounter = 0;
+const wss = new WebSocketServer({ server });
+
+let audioBuffers = [[], []]; // Two buffers for double buffering
+let currentBufferIndex = 0;
+let fileCounter = 1;
+let connectedClient = null;
+
 
 const sampleRate = 16000;
 const channels = 1;
 const bitDepth = 16;
 const saveInterval = 10000; // 30 seconds in milliseconds
+
+// Transcription function
+const transcribeFile = async (filePath) => {
+  const fileBuffer = await fs.readFile(filePath);
+  const fileName = path.basename(filePath);
+
+  const form = new FormData();
+  form.append('file', fileBuffer, {
+    filename: fileName,
+    contentType: 'audio/wav',
+  });
+  form.append('model', 'saaras:v1');
+
+ // console.log('FormData:', form);
+
+  const options = {
+    method: 'POST',
+    headers: {
+      'api-subscription-key': process.env.SARVAM_API_KEY,
+    },
+    body: form
+  };
+
+  const response = await fetch('https://api.sarvam.ai/speech-to-text-translate', options);
+  
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error(`Response status: ${response.status}`);
+    console.error(`Response body: ${errorBody}`);
+    throw new Error(`HTTP error! status: ${response.status}, body: ${errorBody}`);
+  }
+  
+  return await response.json();
+};
 
 async function saveBufferAsWav() {
   if (audioBuffer.length === 0) {
@@ -139,6 +190,20 @@ async function saveBufferAsWav() {
     console.log(`Saved ${fileName} (${audioBuffer.length} chunks, ${dataSize} bytes)`);
     fileCounter++; // Increment the counter after saving
     audioBuffer = []; // Clear the buffer
+    try {
+      const transcription = await transcribeFile(fileName);
+      console.log(`Transcription>>>> for ${fileName}:`, transcription);
+      if (connectedClient && connectedClient.readyState === WebSocket.OPEN) {
+        connectedClient.send(JSON.stringify({ fileName, transcription }));
+      }
+
+      // Delete the audio file after transcription
+      // await fs.unlink(fileName);
+      // console.log(`Deleted file: ${fileName}`);
+
+    } catch (transcriptionError) {
+      console.error(`Error transcribing ${fileName}:`, transcriptionError);
+    }
   } catch (error) {
     console.error(`Error saving file ${fileName}:`, error);
   }
@@ -152,6 +217,11 @@ const saveIntervalId = setInterval(async () => {
 
 wss.on('connection', (ws) => {
   console.log('Client connected');
+  connectedClient = ws; // Store the connected client
+
+  ws.on('error', (error) => {
+    console.error('WebSocket error:', error);
+  });
 
   ws.on('message', (data) => {
     console.log(`Received data chunk: ${data.length} bytes`);
@@ -174,4 +244,4 @@ process.on('SIGINT', () => {
   process.exit();
 });
 
-console.log('WebSocket server is running on ws://localhost:8080');
+console.log('WebSocket server is running and attached to Express.js');
