@@ -83,9 +83,8 @@
 
 // console.log('WebSocket server is running on ws://localhost:8080');
 
-
 import express from 'express';
-import { WebSocketServer, WebSocket } from 'ws'; 
+import { WebSocketServer, WebSocket } from 'ws';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { createReadStream } from 'fs'; 
@@ -96,7 +95,7 @@ import fetch from 'node-fetch';
 dotenv.config();
 
 const app = express();
-const port = process.env.PORT || 8080;
+const port = process.env.PORT || 3000;
 
 // WebSocket setup
 const server = app.listen(port, () => {
@@ -109,7 +108,6 @@ let audioBuffers = [[], []]; // Two buffers for double buffering
 let currentBufferIndex = 0;
 let fileCounter = 1;
 let connectedClient = null;
-
 
 const sampleRate = 16000;
 const channels = 1;
@@ -128,7 +126,7 @@ const transcribeFile = async (filePath) => {
   });
   form.append('model', 'saaras:v1');
 
- // console.log('FormData:', form);
+  console.log('FormData:', form);
 
   const options = {
     method: 'POST',
@@ -150,13 +148,13 @@ const transcribeFile = async (filePath) => {
   return await response.json();
 };
 
-async function saveBufferAsWav() {
-  if (audioBuffer.length === 0) {
+async function saveBufferAsWav(bufferToSave) {
+  if (bufferToSave.length === 0) {
     console.log("Buffer is empty, skipping save.");
     return;
   }
 
-  const dataSize = audioBuffer.reduce((acc, chunk) => acc + chunk.length, 0) * 2; // 2 bytes per sample
+  const dataSize = bufferToSave.reduce((acc, chunk) => acc + chunk.length, 0) * 2; // 2 bytes per sample
   const buffer = Buffer.alloc(44 + dataSize);
 
   // WAV header
@@ -176,7 +174,7 @@ async function saveBufferAsWav() {
 
   // Audio data
   let offset = 44;
-  for (const chunk of audioBuffer) {
+  for (const chunk of bufferToSave) {
     for (let i = 0; i < chunk.length; i++) {
       buffer.writeInt16LE(chunk[i], offset);
       offset += 2;
@@ -187,12 +185,15 @@ async function saveBufferAsWav() {
   const fileName = `audio_${fileCounter}.wav`;
   try {
     await fs.writeFile(fileName, buffer);
-    console.log(`Saved ${fileName} (${audioBuffer.length} chunks, ${dataSize} bytes)`);
+    console.log(`Saved ${fileName} (${bufferToSave.length} chunks, ${dataSize} bytes)`);
     fileCounter++; // Increment the counter after saving
-    audioBuffer = []; // Clear the buffer
+    bufferToSave.length = 0;
+console.log("cleared buffer,",bufferToSave.length)
     try {
       const transcription = await transcribeFile(fileName);
-      console.log(`Transcription>>>> for ${fileName}:`, transcription);
+      console.log(`Transcription for ${fileName}:`, transcription);
+
+      // Send the transcription result to the connected client
       if (connectedClient && connectedClient.readyState === WebSocket.OPEN) {
         connectedClient.send(JSON.stringify({ fileName, transcription }));
       }
@@ -200,7 +201,6 @@ async function saveBufferAsWav() {
       // Delete the audio file after transcription
       // await fs.unlink(fileName);
       // console.log(`Deleted file: ${fileName}`);
-
     } catch (transcriptionError) {
       console.error(`Error transcribing ${fileName}:`, transcriptionError);
     }
@@ -212,28 +212,34 @@ async function saveBufferAsWav() {
 // Set up the interval to save every 30 seconds
 const saveIntervalId = setInterval(async () => {
   console.log("30 seconds passed, saving file...");
-  await saveBufferAsWav();
+  
+  // Swap buffers
+  const bufferToSave = audioBuffers[currentBufferIndex];
+  currentBufferIndex = (currentBufferIndex + 1) % 2;
+  
+  // Save the buffer in the background
+  saveBufferAsWav(bufferToSave);
 }, saveInterval);
 
 wss.on('connection', (ws) => {
   console.log('Client connected');
   connectedClient = ws; // Store the connected client
 
-  ws.on('error', (error) => {
-    console.error('WebSocket error:', error);
-  });
-
   ws.on('message', (data) => {
-    console.log(`Received data chunk: ${data.length} bytes`);
+    // console.log(`Received data chunk: ${data.length} bytes`);
     // Convert the received buffer to Int16Array
     const int16Array = new Int16Array(data.buffer, data.byteOffset, data.length / 2);
-    audioBuffer.push(int16Array);
+    audioBuffers[currentBufferIndex].push(int16Array);
   });
 
   ws.on('close', async () => {
     console.log('Client disconnected');
+    connectedClient = null; // Clear the stored client
+    
     // Save any remaining audio data
-    await saveBufferAsWav();
+    const bufferToSave = audioBuffers[currentBufferIndex];
+    currentBufferIndex = (currentBufferIndex + 1) % 2;
+    await saveBufferAsWav(bufferToSave);
   });
 });
 
