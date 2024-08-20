@@ -82,21 +82,19 @@
 // });
 
 // console.log('WebSocket server is running on ws://localhost:8080');
-
-import express from 'express';
-import { WebSocketServer, WebSocket } from 'ws';
-import { promises as fs } from 'fs';
-import path from 'path';
-import { createReadStream } from 'fs'; 
-import dotenv from 'dotenv';
-import FormData from 'form-data';
-import fetch from 'node-fetch';
+import express from "express";
+import { WebSocketServer, WebSocket } from "ws";
+import { promises as fs } from "fs";
+import path from "path";
+import dotenv from "dotenv";
+import FormData from "form-data";
+import fetch from "node-fetch";
 
 dotenv.config();
 
 const app = express();
-const port = process.env.PORT || 3000;
-
+const port = process.env.PORT || 8080;
+const NO_DATA_TIMEOUT = 15000; // 60 seconds (adjust as needed)
 // WebSocket setup
 const server = app.listen(port, () => {
   console.log(`Express server is running on http://localhost:${port}`);
@@ -108,60 +106,114 @@ let audioBuffers = [[], []]; // Two buffers for double buffering
 let currentBufferIndex = 0;
 let fileCounter = 1;
 let connectedClient = null;
+let transcriptionQueue = []; // Queue to manage transcription tasks
+let isProcessingQueue = false; // Flag to track if a transcription is being processed
 
 const sampleRate = 16000;
 const channels = 1;
 const bitDepth = 16;
-const saveInterval = 10000; // 30 seconds in milliseconds
-
+const saveInterval = 30000; // 30 seconds in milliseconds
+console.log("transcriptionQueue++++++++>>>>>>>______", transcriptionQueue);
 // Transcription function
 const transcribeFile = async (filePath) => {
   const fileBuffer = await fs.readFile(filePath);
   const fileName = path.basename(filePath);
 
   const form = new FormData();
-  form.append('file', fileBuffer, {
+  form.append("file", fileBuffer, {
     filename: fileName,
-    contentType: 'audio/wav',
+    contentType: "audio/wav",
   });
-  form.append('model', 'saaras:v1');
+  form.append("model", "saaras:v1");
 
-  console.log('FormData:', form);
+  console.log("FormData:", form);
 
   const options = {
-    method: 'POST',
+    method: "POST",
     headers: {
-      'api-subscription-key': process.env.SARVAM_API_KEY,
+      "api-subscription-key": process.env.SARVAM_API_KEY,
     },
-    body: form
+    body: form,
   };
 
-  const response = await fetch('https://api.sarvam.ai/speech-to-text-translate', options);
-  
+  const response = await fetch(
+    "https://api.sarvam.ai/speech-to-text-translate",
+    options
+  );
+
   if (!response.ok) {
     const errorBody = await response.text();
     console.error(`Response status: ${response.status}`);
     console.error(`Response body: ${errorBody}`);
-    throw new Error(`HTTP error! status: ${response.status}, body: ${errorBody}`);
+    throw new Error(
+      `HTTP error! status: ${response.status}, body: ${errorBody}`
+    );
   }
-  
+
   return await response.json();
 };
 
+// Queue processing function
+async function processTranscriptionQueue() {
+  if (isProcessingQueue || transcriptionQueue.length === 0) {
+    return;
+  }
+  console.log("processing _____transcriptionQueue>>", transcriptionQueue);
+  isProcessingQueue = true;
+
+  const { fileName, client } = transcriptionQueue.shift();
+
+  try {
+    const transcription = await transcribeFile(fileName);
+    console.log(`Transcription for ${fileName}:`, transcription);
+    const transcript = transcription?.transcript || "";
+    const responsePayload = {
+      type: "Results",
+      channel: {
+        alternatives: [
+          {
+            transcript: transcript,
+          },
+        ],
+      },
+      start: 0.0, // Explicitly set as double
+      duration: transcript.length / sampleRate, // Approximate duration based on length
+    };
+
+    console.log(`Transcription for ${fileName}: ${transcript}`);
+
+    // Send the transcription result to the connected client
+    if (client && client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify(responsePayload));
+    }
+
+    // Delete the audio file after transcription
+    await fs.unlink(fileName);
+    console.log(`Deleted file: ${fileName}`);
+  } catch (error) {
+    console.error(`Error processing transcription for ${fileName}:`, error);
+  } finally {
+    isProcessingQueue = false;
+    processTranscriptionQueue(); // Process the next task in the queue
+  }
+}
+
 async function saveBufferAsWav(bufferToSave) {
   if (bufferToSave.length === 0) {
+    console.log(bufferToSave);
     console.log("Buffer is empty, skipping save.");
     return;
   }
 
-  const dataSize = bufferToSave.reduce((acc, chunk) => acc + chunk.length, 0) * 2; // 2 bytes per sample
+  const dataSize =
+    bufferToSave.reduce((acc, chunk) => acc + chunk.length, 0) * 2; // 2 bytes per sample
   const buffer = Buffer.alloc(44 + dataSize);
 
   // WAV header
-  buffer.write('RIFF', 0);
+  buffer.write("RIFF", 0);
   buffer.writeUInt32LE(36 + dataSize, 4);
-  buffer.write('WAVE', 8);
-  buffer.write('fmt ', 12);
+  buffer.write("WAVE", 8);
+  buffer.write("fmt ", 12);
   buffer.writeUInt32LE(16, 16);
   buffer.writeUInt16LE(1, 20);
   buffer.writeUInt16LE(channels, 22);
@@ -169,7 +221,7 @@ async function saveBufferAsWav(bufferToSave) {
   buffer.writeUInt32LE(sampleRate * channels * (bitDepth / 8), 28);
   buffer.writeUInt16LE(channels * (bitDepth / 8), 32);
   buffer.writeUInt16LE(bitDepth, 34);
-  buffer.write('data', 36);
+  buffer.write("data", 36);
   buffer.writeUInt32LE(dataSize, 40);
 
   // Audio data
@@ -185,25 +237,19 @@ async function saveBufferAsWav(bufferToSave) {
   const fileName = `audio_${fileCounter}.wav`;
   try {
     await fs.writeFile(fileName, buffer);
-    console.log(`Saved ${fileName} (${bufferToSave.length} chunks, ${dataSize} bytes)`);
-    fileCounter++; // Increment the counter after saving
+    console.log(
+      `Saved ${fileName} (${bufferToSave.length} chunks, ${dataSize} bytes)`
+    );
+
+    // Clear the buffer after saving
     bufferToSave.length = 0;
-console.log("cleared buffer,",bufferToSave.length)
-    try {
-      const transcription = await transcribeFile(fileName);
-      console.log(`Transcription for ${fileName}:`, transcription);
 
-      // Send the transcription result to the connected client
-      if (connectedClient && connectedClient.readyState === WebSocket.OPEN) {
-        connectedClient.send(JSON.stringify({ fileName, transcription }));
-      }
+    fileCounter++; // Increment the counter after saving
 
-      // Delete the audio file after transcription
-      // await fs.unlink(fileName);
-      // console.log(`Deleted file: ${fileName}`);
-    } catch (transcriptionError) {
-      console.error(`Error transcribing ${fileName}:`, transcriptionError);
-    }
+    // Add the transcription task to the queue
+    transcriptionQueue.push({ fileName, client: connectedClient });
+    console.log("adde to queu");
+    processTranscriptionQueue(); // Start processing the queue
   } catch (error) {
     console.error(`Error saving file ${fileName}:`, error);
   }
@@ -212,30 +258,46 @@ console.log("cleared buffer,",bufferToSave.length)
 // Set up the interval to save every 30 seconds
 const saveIntervalId = setInterval(async () => {
   console.log("30 seconds passed, saving file...");
-  
+
   // Swap buffers
   const bufferToSave = audioBuffers[currentBufferIndex];
   currentBufferIndex = (currentBufferIndex + 1) % 2;
-  
+
   // Save the buffer in the background
   saveBufferAsWav(bufferToSave);
 }, saveInterval);
 
-wss.on('connection', (ws) => {
-  console.log('Client connected');
+wss.on("connection", (ws) => {
+  console.log("Client connected");
   connectedClient = ws; // Store the connected client
 
-  ws.on('message', (data) => {
+  let noDataTimer = setTimeout(() => {
+    console.log("No data received for 60 seconds, closing connection");
+    ws.close();
+  }, NO_DATA_TIMEOUT);
+
+  ws.on("message", (data) => {
     // console.log(`Received data chunk: ${data.length} bytes`);
+
+    clearTimeout(noDataTimer);
+    noDataTimer = setTimeout(() => {
+      console.log("No data received for 60 seconds, closing connection");
+      ws.close();
+    }, NO_DATA_TIMEOUT);
     // Convert the received buffer to Int16Array
-    const int16Array = new Int16Array(data.buffer, data.byteOffset, data.length / 2);
+    const int16Array = new Int16Array(
+      data.buffer,
+      data.byteOffset,
+      data.length / 2
+    );
     audioBuffers[currentBufferIndex].push(int16Array);
   });
 
-  ws.on('close', async () => {
-    console.log('Client disconnected');
+  ws.on("close", async () => {
+    console.log("Client disconnected");
     connectedClient = null; // Clear the stored client
-    
+    clearTimeout(noDataTimer); // Clear the timer when the connection is closed
+
     // Save any remaining audio data
     const bufferToSave = audioBuffers[currentBufferIndex];
     currentBufferIndex = (currentBufferIndex + 1) % 2;
@@ -244,10 +306,10 @@ wss.on('connection', (ws) => {
 });
 
 // Cleanup function to clear the interval when the server is shutting down
-process.on('SIGINT', () => {
+process.on("SIGINT", () => {
   clearInterval(saveIntervalId);
-  console.log('Interval cleared. Shutting down...');
+  console.log("Interval cleared. Shutting down...");
   process.exit();
 });
 
-console.log('WebSocket server is running and attached to Express.js');
+console.log("WebSocket server is running and attached to Express.js");
